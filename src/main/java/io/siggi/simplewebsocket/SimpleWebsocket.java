@@ -426,15 +426,33 @@ public class SimpleWebsocket implements Closeable {
         closeNow(new WebSocketMessage(WebSocketMessage.OPCODE_CLOSE, payload));
     }
 
+    /**
+     * Close the connection, sending a close frame first.
+     * <p>
+     * In non-blocking mode this returns immediately: messages already queued are sent, followed by the close frame,
+     * and then the socket is closed. If that takes longer than 5 seconds, the socket is closed anyway.
+     *
+     * @throws IOException never in practice, errors while closing are ignored
+     */
     @Override
     public void close() throws IOException {
+        boolean letOutgoingThreadFinish;
         synchronized (sendQueueLock) {
             if (closed) {
                 return;
             }
             closed = true;
+            letOutgoingThreadFinish = nonBlockingMode;
+            if (letOutgoingThreadFinish && !closeQueued) {
+                sendQueue.add(WebSocketMessage.create(WebSocketMessage.OPCODE_CLOSE));
+            }
             closeQueued = true;
             sendQueueLock.notifyAll();
+        }
+        if (letOutgoingThreadFinish) {
+            // The outgoing thread sends what's queued, then closes the socket.
+            scheduleForceClose();
+            return;
         }
         closeNow(WebSocketMessage.create(WebSocketMessage.OPCODE_CLOSE));
     }
@@ -545,12 +563,13 @@ public class SimpleWebsocket implements Closeable {
                 // so a peer that stops reading can't block close() or send().
                 synchronized (sendQueueLock) {
                     while (true) {
-                        if (closed) {
-                            return;
-                        }
                         if (!sendQueue.isEmpty()) {
                             msg = sendQueue.remove(0);
                             break;
+                        }
+                        if (closed) {
+                            // Everything queued before close() has been sent.
+                            return;
                         }
                         if (pingFrequency <= 0L) {
                             // Pings disabled, wait until there's something to send.
@@ -572,10 +591,13 @@ public class SimpleWebsocket implements Closeable {
             }
         } catch (IOException | InterruptedException e) {
         } finally {
-            try {
-                close();
-            } catch (Exception e) {
+            synchronized (sendQueueLock) {
+                closed = true;
+                closeQueued = true;
+                sendQueue.clear();
+                sendQueueLock.notifyAll();
             }
+            closeSocket();
         }
     }
 
