@@ -8,6 +8,7 @@ import javax.net.ssl.SSLSocketFactory;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -17,6 +18,8 @@ import java.util.List;
 import java.util.Map;
 
 class SimpleWebsocketUtil {
+    private static final int HANDSHAKE_TIMEOUT = 15000;
+
     static SimpleWebsocket connect(URI uri, WebsocketHeaders requestHeaders) throws IOException {
         if (requestHeaders == null) requestHeaders = new WebsocketHeaders();
         String scheme = uri.getScheme().toLowerCase();
@@ -30,19 +33,17 @@ class SimpleWebsocketUtil {
             port = defaultPort;
         String path = uri.getPath();
 
-        Socket socket;
-
-        if (secure) {
-            socket = SSLSocketFactory.getDefault().createSocket(host, port);
-        } else {
-            socket = new Socket(host, port);
-        }
+        Socket socket = new Socket();
 
         boolean success = false;
         try {
-            if (socket instanceof SSLSocket) {
+            socket.connect(new InetSocketAddress(host, port), HANDSHAKE_TIMEOUT);
+            socket.setSoTimeout(HANDSHAKE_TIMEOUT);
+            if (secure) {
                 // SSLSocket only checks the certificate chain, not that the certificate is for this host.
-                SSLSocket sslSocket = (SSLSocket) socket;
+                SSLSocket sslSocket = (SSLSocket) ((SSLSocketFactory) SSLSocketFactory.getDefault())
+                        .createSocket(socket, host, port, true);
+                socket = sslSocket;
                 SSLParameters parameters = sslSocket.getSSLParameters();
                 parameters.setEndpointIdentificationAlgorithm("HTTPS");
                 sslSocket.setSSLParameters(parameters);
@@ -72,7 +73,11 @@ class SimpleWebsocketUtil {
             writeLine(out, "");
 
             String firstLine = readLine(in);
-            if (!firstLine.contains("101")) {
+            if (firstLine == null) {
+                throw new IOException("Connection closed during WebSocket handshake");
+            }
+            String[] statusLine = firstLine.split(" ", 3);
+            if (statusLine.length < 2 || !statusLine[0].startsWith("HTTP/") || !statusLine[1].equals("101")) {
                 throw new IOException("Server does not support WebSocket");
             }
             Map<String, String> headers = readHeaders(in);
