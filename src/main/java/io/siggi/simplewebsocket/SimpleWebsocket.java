@@ -296,7 +296,12 @@ public class SimpleWebsocket implements Closeable {
         }
     }
 
-    private final ByteArrayOutputStream readBuffer = new ByteArrayOutputStream();
+    private ByteArrayOutputStream readBuffer = new ByteArrayOutputStream();
+    /**
+     * After a fragmented message larger than this, the reassembly buffer is replaced instead of reused, so a single
+     * large message doesn't keep a large buffer allocated for the rest of the connection.
+     */
+    private static final int KEEP_READ_BUFFER_SIZE = 65536;
     private int readOpcode = 0;
     private boolean messageInProgress = false;
     private boolean receivedCloseFrame = false;
@@ -350,7 +355,11 @@ public class SimpleWebsocket implements Closeable {
                 if (readBuffer.size() != 0) {
                     readBuffer.write(pkt.payload);
                     payload = readBuffer.toByteArray();
-                    readBuffer.reset();
+                    if (payload.length > KEEP_READ_BUFFER_SIZE) {
+                        readBuffer = new ByteArrayOutputStream();
+                    } else {
+                        readBuffer.reset();
+                    }
                 } else {
                     payload = pkt.payload;
                 }
