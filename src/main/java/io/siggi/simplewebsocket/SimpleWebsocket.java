@@ -512,6 +512,10 @@ public class SimpleWebsocket implements Closeable {
      * and close the connection.
      */
     private void closeWithStatus(int statusCode) {
+        byte[] payload = new byte[]{(byte) ((statusCode >> 8) & 0xff), (byte) (statusCode & 0xff)};
+        // Write the close frame before setting closed: in non-blocking mode the outgoing thread exits and closes
+        // the socket as soon as it sees closed with an empty queue, which would race with this write.
+        closeNow(new WebSocketMessage(WebSocketMessage.OPCODE_CLOSE, payload));
         synchronized (sendQueueLock) {
             closed = true;
             closeQueued = true;
@@ -519,8 +523,6 @@ public class SimpleWebsocket implements Closeable {
             queuedBytes = 0L;
             sendQueueLock.notifyAll();
         }
-        byte[] payload = new byte[]{(byte) ((statusCode >> 8) & 0xff), (byte) (statusCode & 0xff)};
-        closeNow(new WebSocketMessage(WebSocketMessage.OPCODE_CLOSE, payload));
     }
 
     /**
