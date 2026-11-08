@@ -103,17 +103,22 @@ public class SimpleWebsocket implements Closeable {
     }
 
     private final ByteArrayOutputStream readBuffer = new ByteArrayOutputStream();
+    private int readOpcode = 0;
 
     private WebSocketMessage read0() throws IOException {
-        int opcode = 0;
         while (true) {
             WebSocketPacket pkt = read1();
             if (pkt == null) {
                 return null;
             }
+            if (pkt.opcode >= 0x8) {
+                // Control frames may be interleaved with the fragments of a data message
+                // and must not disturb the message being reassembled.
+                return new WebSocketMessage(pkt.opcode, pkt.decoded);
+            }
             if (pkt.opcode != WebSocketMessage.OPCODE_CONTINUATION) {
                 readBuffer.reset();
-                opcode = pkt.opcode;
+                readOpcode = pkt.opcode;
             }
             if (pkt.fin) {
                 byte[] payload;
@@ -124,7 +129,7 @@ public class SimpleWebsocket implements Closeable {
                 } else {
                     payload = pkt.decoded;
                 }
-                return new WebSocketMessage(opcode, payload);
+                return new WebSocketMessage(readOpcode, payload);
             } else {
                 readBuffer.write(pkt.decoded);
             }
