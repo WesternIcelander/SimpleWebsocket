@@ -287,12 +287,33 @@ public class SimpleWebsocket implements Closeable {
     private final ByteArrayOutputStream readBuffer = new ByteArrayOutputStream();
     private int readOpcode = 0;
     private boolean messageInProgress = false;
+    private boolean receivedCloseFrame = false;
 
     private WebSocketMessage read0() throws IOException {
         while (true) {
+            if (receivedCloseFrame) {
+                return null;
+            }
             WebSocketPacket pkt = read1();
             if (pkt == null) {
                 return null;
+            }
+            if (pkt.opcode == WebSocketMessage.OPCODE_CLOSE) {
+                byte[] p = pkt.payload;
+                if (p.length >= 2) {
+                    if (!isValidCloseCode(((p[0] & 0xff) << 8) | (p[1] & 0xff))) {
+                        return fail(CLOSE_PROTOCOL_ERROR);
+                    }
+                    if (!isValidUtf8(p, 2)) {
+                        return fail(CLOSE_INVALID_DATA);
+                    }
+                } else if (p.length == 1) {
+                    return fail(CLOSE_PROTOCOL_ERROR);
+                }
+                receivedCloseFrame = true;
+                // Answer with a close frame echoing the status code (unless we sent one already), then close.
+                closeWith(p.length >= 2 ? new byte[]{p[0], p[1]} : new byte[0]);
+                return new WebSocketMessage(pkt.opcode, p);
             }
             if (pkt.opcode >= 0x8) {
                 // Control frames may be interleaved with the fragments of a data message
@@ -398,6 +419,11 @@ public class SimpleWebsocket implements Closeable {
         } catch (CharacterCodingException e) {
             return false;
         }
+    }
+
+    private static boolean isValidCloseCode(int code) {
+        // 1004, 1005, 1006 and 1015 are reserved and must never be sent, 1016-2999 are unassigned.
+        return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999);
     }
 
     private static boolean isKnownOpcode(int opcode) {
@@ -582,7 +608,14 @@ public class SimpleWebsocket implements Closeable {
      * and close the connection.
      */
     private void closeWithStatus(int statusCode) {
-        byte[] payload = new byte[]{(byte) ((statusCode >> 8) & 0xff), (byte) (statusCode & 0xff)};
+        closeWith(new byte[]{(byte) ((statusCode >> 8) & 0xff), (byte) (statusCode & 0xff)});
+    }
+
+    /**
+     * Send a close frame with the given payload (best effort, written immediately, bypassing the send queue) and
+     * close the connection.
+     */
+    private void closeWith(byte[] payload) {
         // Write the close frame before setting closed: in non-blocking mode the outgoing thread exits and closes
         // the socket as soon as it sees closed with an empty queue, which would race with this write.
         closeNow(new WebSocketMessage(WebSocketMessage.OPCODE_CLOSE, payload));
