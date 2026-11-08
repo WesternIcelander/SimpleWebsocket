@@ -39,6 +39,11 @@ public class SimpleWebsocket implements Closeable {
     public static final int CLOSE_MESSAGE_TOO_BIG = 1009;
 
     /**
+     * Close status code sent when the peer violates the WebSocket protocol.
+     */
+    public static final int CLOSE_PROTOCOL_ERROR = 1002;
+
+    /**
      * The largest frame or message size that can be received, limited by the maximum size of a Java array.
      */
     public static final long MAX_SIZE_LIMIT = Integer.MAX_VALUE - 8;
@@ -272,6 +277,7 @@ public class SimpleWebsocket implements Closeable {
 
     private final ByteArrayOutputStream readBuffer = new ByteArrayOutputStream();
     private int readOpcode = 0;
+    private boolean messageInProgress = false;
 
     private WebSocketMessage read0() throws IOException {
         while (true) {
@@ -282,94 +288,134 @@ public class SimpleWebsocket implements Closeable {
             if (pkt.opcode >= 0x8) {
                 // Control frames may be interleaved with the fragments of a data message
                 // and must not disturb the message being reassembled.
-                return new WebSocketMessage(pkt.opcode, pkt.decoded);
+                return new WebSocketMessage(pkt.opcode, pkt.payload);
             }
-            if (pkt.opcode != WebSocketMessage.OPCODE_CONTINUATION) {
+            if (pkt.opcode == WebSocketMessage.OPCODE_CONTINUATION) {
+                if (!messageInProgress) {
+                    return fail(CLOSE_PROTOCOL_ERROR); // continuation without a message to continue
+                }
+            } else {
+                if (messageInProgress) {
+                    return fail(CLOSE_PROTOCOL_ERROR); // new message before the previous one was finished
+                }
                 readBuffer.reset();
                 readOpcode = pkt.opcode;
             }
             if (pkt.fin) {
+                messageInProgress = false;
                 byte[] payload;
                 if (readBuffer.size() != 0) {
-                    readBuffer.write(pkt.decoded);
+                    readBuffer.write(pkt.payload);
                     payload = readBuffer.toByteArray();
                     readBuffer.reset();
                 } else {
-                    payload = pkt.decoded;
+                    payload = pkt.payload;
                 }
                 return new WebSocketMessage(readOpcode, payload);
             } else {
-                readBuffer.write(pkt.decoded);
+                messageInProgress = true;
+                readBuffer.write(pkt.payload);
             }
         }
     }
 
     private WebSocketPacket read1() throws IOException {
-        int opcode = in.read();
-        if (opcode == -1) {
+        int b0 = in.read();
+        if (b0 == -1) {
             return null;
         }
-        boolean fin = (opcode & 0x80) != 0;
-        boolean rsv1 = (opcode & 0x40) != 0;
-        boolean rsv2 = (opcode & 0x20) != 0;
-        boolean rsv3 = (opcode & 0x10) != 0;
-        opcode = opcode & 0x0F;
-        long lengthOfPayload = (long) in.read();
-        if (lengthOfPayload == -1L) {
+        int b1 = in.read();
+        if (b1 == -1) {
             return null;
         }
-        boolean mask = (lengthOfPayload & 0x80L) != 0L;
-        lengthOfPayload = lengthOfPayload & 0x7F;
-        if (lengthOfPayload == 126L) {
-            lengthOfPayload = (long) ((in.read() << 8) + in.read());
-        } else if (lengthOfPayload == 127L) {
-            lengthOfPayload = ((long) in.read() << 56)
-                    + ((long) in.read() << 48)
-                    + ((long) in.read() << 40)
-                    + ((long) in.read() << 32)
-                    + ((long) in.read() << 24)
-                    + ((long) in.read() << 16)
-                    + ((long) in.read() << 8)
-                    + (long) in.read();
+        boolean fin = (b0 & 0x80) != 0;
+        boolean rsv = (b0 & 0x70) != 0;
+        int opcode = b0 & 0x0F;
+        boolean mask = (b1 & 0x80) != 0;
+        long lengthOfPayload = b1 & 0x7F;
+        if (lengthOfPayload == 126L || lengthOfPayload == 127L) {
+            byte[] extendedLength = readFully(lengthOfPayload == 126L ? 2 : 8);
+            if (extendedLength == null) {
+                return null;
+            }
+            lengthOfPayload = 0L;
+            for (byte b : extendedLength) {
+                lengthOfPayload = (lengthOfPayload << 8) | (b & 0xffL);
+            }
+        }
+        boolean controlFrame = opcode >= 0x8;
+        if (rsv // no extensions are negotiated, so the reserved bits must be 0
+                || !isKnownOpcode(opcode)
+                || (controlFrame && (!fin || lengthOfPayload > 125L)) // control frames can't be fragmented or long
+                || mask == isClient) { // clients must mask their frames, servers must not
+            return fail(CLOSE_PROTOCOL_ERROR);
         }
         // Check the limits before allocating anything. A 64-bit length with the high bit set is negative.
         long messageSizeSoFar = opcode == WebSocketMessage.OPCODE_CONTINUATION ? readBuffer.size() : 0L;
         if (lengthOfPayload < 0L
                 || lengthOfPayload > maxPayloadLength
-                || (opcode < 0x8 && messageSizeSoFar + lengthOfPayload > maxMessageSize)) {
-            closeWithStatus(CLOSE_MESSAGE_TOO_BIG);
-            return null;
+                || (!controlFrame && messageSizeSoFar + lengthOfPayload > maxMessageSize)) {
+            return fail(CLOSE_MESSAGE_TOO_BIG);
         }
-        byte[] maskKey = new byte[4];
-        int amountRead = 0;
-        int c;
+        byte[] maskKey = null;
         if (mask) {
-            while (amountRead < 4) {
-                c = in.read(maskKey, amountRead, 4 - amountRead);
-                if (c == -1) {
-                    return null;
-                }
-                amountRead += c;
+            maskKey = readFully(4);
+            if (maskKey == null) {
+                return null;
             }
         }
-        byte[] message = new byte[(int) lengthOfPayload];
-        amountRead = 0;
-        while (amountRead < lengthOfPayload) {
-            c = in.read(message, amountRead, message.length - amountRead);
+        byte[] payload = readFully((int) lengthOfPayload);
+        if (payload == null) {
+            return null;
+        }
+        if (mask) {
+            for (int i = 0; i < payload.length; i++) {
+                payload[i] ^= maskKey[i & 3];
+            }
+        }
+        return new WebSocketPacket(fin, opcode, payload);
+    }
+
+    private static boolean isKnownOpcode(int opcode) {
+        switch (opcode) {
+            case WebSocketMessage.OPCODE_CONTINUATION:
+            case WebSocketMessage.OPCODE_TEXT:
+            case WebSocketMessage.OPCODE_BINARY:
+            case WebSocketMessage.OPCODE_CLOSE:
+            case WebSocketMessage.OPCODE_PING:
+            case WebSocketMessage.OPCODE_PONG:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Read exactly length bytes.
+     *
+     * @return the bytes, or null if the stream ended first
+     */
+    private byte[] readFully(int length) throws IOException {
+        byte[] bytes = new byte[length];
+        int amountRead = 0;
+        while (amountRead < length) {
+            int c = in.read(bytes, amountRead, length - amountRead);
             if (c == -1) {
                 return null;
             }
             amountRead += c;
         }
-        byte[] decoded = new byte[message.length];
-        if (mask) {
-            for (int i = 0; i < message.length; i++) {
-                decoded[i] = (byte) ((((int) message[i]) & 0xff) ^ (((int) maskKey[i % 4]) & 0xff));
-            }
-        } else {
-            System.arraycopy(message, 0, decoded, 0, message.length);
-        }
-        return new WebSocketPacket(fin, rsv1, rsv2, rsv3, opcode, mask, maskKey, lengthOfPayload, message, decoded);
+        return bytes;
+    }
+
+    /**
+     * Fail the connection: send a close frame with the status code and close.
+     *
+     * @return null, for convenient use as {@code return fail(code);} in the read methods
+     */
+    private <T> T fail(int statusCode) {
+        closeWithStatus(statusCode);
+        return null;
     }
 
     /**
@@ -708,30 +754,14 @@ public class SimpleWebsocket implements Closeable {
     }
 
     private static class WebSocketPacket {
-
         private final boolean fin;
-        private final boolean rsv1;
-        private final boolean rsv2;
-        private final boolean rsv3;
         private final int opcode;
-        private final boolean mask;
-        private final byte[] maskKey;
-        private final long lengthOfPayload;
-        private final byte[] message;
-        private final byte[] decoded;
+        private final byte[] payload;
 
-        private WebSocketPacket(boolean fin, boolean rsv1, boolean rsv2, boolean rsv3, int opcode, boolean mask, byte[] maskKey, long lengthOfPayload, byte[] message, byte[] decoded) {
+        private WebSocketPacket(boolean fin, int opcode, byte[] payload) {
             this.fin = fin;
-            this.rsv1 = rsv1;
-            this.rsv2 = rsv2;
-            this.rsv3 = rsv3;
             this.opcode = opcode;
-            this.mask = mask;
-            this.maskKey = maskKey;
-            this.lengthOfPayload = lengthOfPayload;
-            this.message = message;
-            this.decoded = decoded;
+            this.payload = payload;
         }
-
     }
 }
