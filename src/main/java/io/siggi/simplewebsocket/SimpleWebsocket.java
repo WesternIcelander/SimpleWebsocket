@@ -17,6 +17,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ThreadFactory;
 
 public class SimpleWebsocket implements Closeable {
@@ -403,18 +404,15 @@ public class SimpleWebsocket implements Closeable {
         socket.close();
     }
 
-    private final Set<WebSocketListener> listeners = new HashSet<>();
+    // Copy-on-write, so listeners can add or remove listeners from inside a callback.
+    private final Set<WebSocketListener> listeners = new CopyOnWriteArraySet<>();
 
     public void addListener(WebSocketListener listener) {
-        synchronized (listeners) {
-            listeners.add(listener);
-        }
+        listeners.add(listener);
     }
 
     public void removeListener(WebSocketListener listener) {
-        synchronized (listeners) {
-            listeners.remove(listener);
-        }
+        listeners.remove(listener);
     }
 
     private void incomingThread() {
@@ -435,24 +433,24 @@ public class SimpleWebsocket implements Closeable {
                     case WebSocketMessage.OPCODE_PONG:
                         break;
                 }
-                synchronized (listeners) {
-                    for (WebSocketListener listener : listeners) {
-                        try {
-                            listener.receivedMessage(this, msg);
-                        } catch (Exception e) {
-                        }
+                for (WebSocketListener listener : listeners) {
+                    try {
+                        listener.receivedMessage(this, msg);
+                    } catch (Exception e) {
                     }
                 }
             }
-        } catch (IOException e) {
-        }
-        try {
-            close();
         } catch (Exception e) {
-        }
-        synchronized (listeners) {
+        } finally {
+            try {
+                close();
+            } catch (Exception e) {
+            }
             for (WebSocketListener listener : listeners) {
-                listener.socketClosed(this);
+                try {
+                    listener.socketClosed(this);
+                } catch (Exception e) {
+                }
             }
         }
     }
