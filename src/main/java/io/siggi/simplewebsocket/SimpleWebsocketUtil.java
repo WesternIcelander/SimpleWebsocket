@@ -2,6 +2,8 @@ package io.siggi.simplewebsocket;
 
 import io.siggi.http.HTTPRequest;
 
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import java.io.IOException;
 import java.io.InputStream;
@@ -38,6 +40,14 @@ class SimpleWebsocketUtil {
 
         boolean success = false;
         try {
+            if (socket instanceof SSLSocket) {
+                // SSLSocket only checks the certificate chain, not that the certificate is for this host.
+                SSLSocket sslSocket = (SSLSocket) socket;
+                SSLParameters parameters = sslSocket.getSSLParameters();
+                parameters.setEndpointIdentificationAlgorithm("HTTPS");
+                sslSocket.setSSLParameters(parameters);
+                sslSocket.startHandshake();
+            }
 
             InputStream in = socket.getInputStream();
             OutputStream out = socket.getOutputStream();
