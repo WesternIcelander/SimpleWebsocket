@@ -325,13 +325,19 @@ public class SimpleWebsocket implements Closeable {
         return new WebSocketPacket(fin, rsv1, rsv2, rsv3, opcode, mask, maskKey, lengthOfPayload, message, decoded);
     }
 
+    /**
+     * Send a message. In non-blocking mode the message is queued and sent by the outgoing thread.
+     *
+     * @param msg the message to send
+     * @throws IOException if the connection is closed or closing, or the message could not be written
+     */
     public void send(WebSocketMessage msg) throws IOException {
         boolean isClose = msg.getOpcode() == WebSocketMessage.OPCODE_CLOSE;
         if (nonBlockingMode) {
             synchronized (sendQueueLock) {
                 if (closeQueued) {
                     if (isClose) return;
-                    throw new IllegalStateException("Already sent close frame!");
+                    throw new IOException("WebSocket is closed");
                 }
                 if (isClose) closeQueued = true;
                 sendQueue.add(msg);
@@ -343,7 +349,7 @@ public class SimpleWebsocket implements Closeable {
         try {
             if (sentCloseFrame) {
                 if (isClose) return;
-                throw new IllegalStateException("Already sent close frame!");
+                throw new IOException("WebSocket is closed");
             }
             writeFrame(msg);
         } finally {
