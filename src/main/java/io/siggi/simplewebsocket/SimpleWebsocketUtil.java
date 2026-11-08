@@ -86,7 +86,9 @@ class SimpleWebsocketUtil {
             Map<String, String> headers = readHeaders(in);
 
             String response = headers.get("sec-websocket-accept");
-            if (!expectedResponse.equals(response)) {
+            if (!expectedResponse.equals(response)
+                    || !hasToken(headers.get("upgrade"), "websocket")
+                    || !hasToken(headers.get("connection"), "Upgrade")) {
                 throw new IOException("Server does not support WebSocket");
             }
             success = true;
