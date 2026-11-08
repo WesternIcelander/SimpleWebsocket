@@ -27,7 +27,14 @@ public class SimpleWebsocket implements Closeable {
     private final boolean isClient;
     private final SecureRandom random;
 
-    private long maxPayloadLength = 16384;
+    /**
+     * Close status code sent when an incoming frame or message exceeds the configured limits.
+     */
+    public static final int CLOSE_MESSAGE_TOO_BIG = 1009;
+
+    private volatile long maxPayloadLength = 16384;
+    private volatile long maxMessageSize = 1048576;
+    private final Object writeLock = new Object();
     private long pingFrequency = 5000L;
     private boolean sentCloseFrame = false;
     private boolean nonBlockingMode = false;
@@ -67,6 +74,46 @@ public class SimpleWebsocket implements Closeable {
 
     public static boolean isWebsocketRequest(HTTPRequest request) {
         return SimpleWebsocketUtil.isWebsocketRequest(request);
+    }
+
+    /**
+     * Get the maximum payload length of a single incoming frame.
+     *
+     * @return the maximum frame payload length in bytes
+     */
+    public long getMaxPayloadLength() {
+        return maxPayloadLength;
+    }
+
+    /**
+     * Set the maximum payload length of a single incoming frame. If a frame larger than this is received, the
+     * connection is closed with status 1009 (Message Too Big). Defaults to 16 KiB.
+     *
+     * @param maxPayloadLength the maximum frame payload length in bytes
+     */
+    public void setMaxPayloadLength(long maxPayloadLength) {
+        if (maxPayloadLength < 0L) throw new IllegalArgumentException("maxPayloadLength must not be negative");
+        this.maxPayloadLength = maxPayloadLength;
+    }
+
+    /**
+     * Get the maximum total size of an incoming message, after reassembling all of its fragments.
+     *
+     * @return the maximum message size in bytes
+     */
+    public long getMaxMessageSize() {
+        return maxMessageSize;
+    }
+
+    /**
+     * Set the maximum total size of an incoming message, after reassembling all of its fragments. If a message grows
+     * beyond this, the connection is closed with status 1009 (Message Too Big). Defaults to 1 MiB.
+     *
+     * @param maxMessageSize the maximum message size in bytes
+     */
+    public void setMaxMessageSize(long maxMessageSize) {
+        if (maxMessageSize < 0L) throw new IllegalArgumentException("maxMessageSize must not be negative");
+        this.maxMessageSize = maxMessageSize;
     }
 
     public void useNonBlockingMode(long pingFrequency) {
@@ -164,7 +211,12 @@ public class SimpleWebsocket implements Closeable {
                     + ((long) in.read() << 8)
                     + (long) in.read();
         }
-        if (lengthOfPayload > maxPayloadLength) {
+        // Check the limits before allocating anything. A 64-bit length with the high bit set is negative.
+        long messageSizeSoFar = opcode == WebSocketMessage.OPCODE_CONTINUATION ? readBuffer.size() : 0L;
+        if (lengthOfPayload < 0L
+                || lengthOfPayload > maxPayloadLength
+                || (opcode < 0x8 && messageSizeSoFar + lengthOfPayload > maxMessageSize)) {
+            closeWithStatus(CLOSE_MESSAGE_TOO_BIG);
             return null;
         }
         byte[] maskKey = new byte[4];
@@ -223,6 +275,12 @@ public class SimpleWebsocket implements Closeable {
     private final byte[] headerBuffer = new byte[14];
 
     private void send0(WebSocketMessage msg) throws IOException {
+        synchronized (writeLock) {
+            send1(msg);
+        }
+    }
+
+    private void send1(WebSocketMessage msg) throws IOException {
         int headerLength = 2;
         headerBuffer[0] = (byte) (0x80 + (msg.getOpcode() & 0xF));
         int len = msg.getLength();
@@ -267,6 +325,29 @@ public class SimpleWebsocket implements Closeable {
             }
         }
         return message;
+    }
+
+    /**
+     * Send a close frame with the given status code (best effort, written immediately, bypassing the send queue)
+     * and close the connection.
+     */
+    private void closeWithStatus(int statusCode) {
+        try {
+            boolean sendFrame;
+            synchronized (sendQueueLock) {
+                sendFrame = !sentCloseFrame;
+                sentCloseFrame = true;
+            }
+            if (sendFrame) {
+                byte[] payload = new byte[]{(byte) ((statusCode >> 8) & 0xff), (byte) (statusCode & 0xff)};
+                send0(new WebSocketMessage(WebSocketMessage.OPCODE_CLOSE, payload));
+            }
+        } catch (IOException ignored) {
+        }
+        try {
+            close();
+        } catch (IOException ignored) {
+        }
     }
 
     @Override
