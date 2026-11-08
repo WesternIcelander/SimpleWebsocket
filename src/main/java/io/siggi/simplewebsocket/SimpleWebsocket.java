@@ -686,12 +686,7 @@ public class SimpleWebsocket implements Closeable {
      * @return true if a close frame has been written, by this call or earlier
      */
     private boolean writeCloseFrame(byte[] payload) {
-        try {
-            if (!writeLock.tryLock(CLOSE_TIMEOUT, TimeUnit.MILLISECONDS)) {
-                return false;
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        if (!lockWithin(writeLock, CLOSE_TIMEOUT)) {
             return false;
         }
         try {
@@ -701,6 +696,29 @@ public class SimpleWebsocket implements Closeable {
             return false;
         } finally {
             writeLock.unlock();
+        }
+    }
+
+    /**
+     * Acquire the lock, waiting at most timeoutMillis. Unlike {@link ReentrantLock#tryLock(long, TimeUnit)}, this
+     * keeps waiting if the thread is interrupted (and restores the interrupt status afterwards), so closing from an
+     * interrupted thread, e.g. during an executor shutdown, still sends the close frame.
+     */
+    private static boolean lockWithin(ReentrantLock lock, long timeoutMillis) {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        boolean interrupted = false;
+        try {
+            while (true) {
+                try {
+                    return lock.tryLock(Math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
