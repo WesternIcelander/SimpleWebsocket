@@ -9,6 +9,10 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -42,6 +46,11 @@ public class SimpleWebsocket implements Closeable {
      * Close status code sent when the peer violates the WebSocket protocol.
      */
     public static final int CLOSE_PROTOCOL_ERROR = 1002;
+
+    /**
+     * Close status code sent when a text message is not valid UTF-8.
+     */
+    public static final int CLOSE_INVALID_DATA = 1007;
 
     /**
      * The largest frame or message size that can be received, limited by the maximum size of a Java array.
@@ -311,6 +320,9 @@ public class SimpleWebsocket implements Closeable {
                 } else {
                     payload = pkt.payload;
                 }
+                if (readOpcode == WebSocketMessage.OPCODE_TEXT && !isValidUtf8(payload, 0)) {
+                    return fail(CLOSE_INVALID_DATA);
+                }
                 return new WebSocketMessage(readOpcode, payload);
             } else {
                 messageInProgress = true;
@@ -374,6 +386,18 @@ public class SimpleWebsocket implements Closeable {
             }
         }
         return new WebSocketPacket(fin, opcode, payload);
+    }
+
+    static boolean isValidUtf8(byte[] bytes, int offset) {
+        try {
+            StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes, offset, bytes.length - offset));
+            return true;
+        } catch (CharacterCodingException e) {
+            return false;
+        }
     }
 
     private static boolean isKnownOpcode(int opcode) {
