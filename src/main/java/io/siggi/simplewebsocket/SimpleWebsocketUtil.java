@@ -84,11 +84,9 @@ class SimpleWebsocketUtil {
     }
 
     static SimpleWebsocket accept(HTTPRequest request) throws IOException {
-        String webSocketKey = request.getHeader("Sec-WebSocket-Key");
-        if (!"Upgrade".equalsIgnoreCase(request.getHeader("Connection"))
-                || !"websocket".equalsIgnoreCase(request.getHeader("Upgrade"))
-                || webSocketKey == null)
+        if (!isWebsocketRequest(request))
             throw new IOException("Not a Websocket request.");
+        String webSocketKey = request.getHeader("Sec-WebSocket-Key");
 
         request.response.setHeader("Sec-WebSocket-Accept", Util.generateExpectedResponse(webSocketKey));
 
@@ -96,12 +94,18 @@ class SimpleWebsocketUtil {
     }
 
     static boolean isWebsocketRequest(HTTPRequest request) {
-        String webSocketKey = request.getHeader("Sec-WebSocket-Key");
-        if (!"Upgrade".equalsIgnoreCase(request.getHeader("Connection"))
-                || !"websocket".equalsIgnoreCase(request.getHeader("Upgrade"))
-                || webSocketKey == null)
-            return false;
-        return true;
+        // Connection and Upgrade are comma separated lists, e.g. Firefox sends "Connection: keep-alive, Upgrade".
+        return hasToken(request.getHeader("Connection"), "Upgrade")
+                && hasToken(request.getHeader("Upgrade"), "websocket")
+                && request.getHeader("Sec-WebSocket-Key") != null;
+    }
+
+    private static boolean hasToken(String headerValue, String token) {
+        if (headerValue == null) return false;
+        for (String part : headerValue.split(",")) {
+            if (part.trim().equalsIgnoreCase(token)) return true;
+        }
+        return false;
     }
 
     private static Map<String, String> readHeaders(InputStream in) throws IOException {
