@@ -38,6 +38,11 @@ public class SimpleWebsocket implements Closeable {
      */
     public static final int CLOSE_MESSAGE_TOO_BIG = 1009;
 
+    /**
+     * The largest frame or message size that can be received, limited by the maximum size of a Java array.
+     */
+    public static final long MAX_SIZE_LIMIT = Integer.MAX_VALUE - 8;
+
     private volatile long maxPayloadLength = 16384;
     private volatile long maxMessageSize = 1048576;
     private long pingFrequency = 5000L;
@@ -114,13 +119,14 @@ public class SimpleWebsocket implements Closeable {
 
     /**
      * Set the maximum payload length of a single incoming frame. If a frame larger than this is received, the
-     * connection is closed with status 1009 (Message Too Big). Defaults to 16 KiB.
+     * connection is closed with status 1009 (Message Too Big). Defaults to 16 KiB. Values above
+     * {@link #MAX_SIZE_LIMIT} are reduced to it.
      *
      * @param maxPayloadLength the maximum frame payload length in bytes
      */
     public void setMaxPayloadLength(long maxPayloadLength) {
         if (maxPayloadLength < 0L) throw new IllegalArgumentException("maxPayloadLength must not be negative");
-        this.maxPayloadLength = maxPayloadLength;
+        this.maxPayloadLength = Math.min(maxPayloadLength, MAX_SIZE_LIMIT);
     }
 
     /**
@@ -134,13 +140,14 @@ public class SimpleWebsocket implements Closeable {
 
     /**
      * Set the maximum total size of an incoming message, after reassembling all of its fragments. If a message grows
-     * beyond this, the connection is closed with status 1009 (Message Too Big). Defaults to 1 MiB.
+     * beyond this, the connection is closed with status 1009 (Message Too Big). Defaults to 1 MiB. Values above
+     * {@link #MAX_SIZE_LIMIT} are reduced to it.
      *
      * @param maxMessageSize the maximum message size in bytes
      */
     public void setMaxMessageSize(long maxMessageSize) {
         if (maxMessageSize < 0L) throw new IllegalArgumentException("maxMessageSize must not be negative");
-        this.maxMessageSize = maxMessageSize;
+        this.maxMessageSize = Math.min(maxMessageSize, MAX_SIZE_LIMIT);
     }
 
     /**
