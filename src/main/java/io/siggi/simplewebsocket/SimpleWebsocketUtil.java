@@ -19,6 +19,9 @@ import java.util.Map;
 
 class SimpleWebsocketUtil {
     private static final int HANDSHAKE_TIMEOUT = 15000;
+    // Limits on the server's handshake response, so a misbehaving server can't make the client buffer forever.
+    private static final int MAX_LINE_LENGTH = 8192;
+    private static final int MAX_HEADER_COUNT = 100;
 
     static SimpleWebsocket connect(URI uri, WebsocketHeaders requestHeaders) throws IOException {
         if (requestHeaders == null) requestHeaders = new WebsocketHeaders();
@@ -126,9 +129,12 @@ class SimpleWebsocketUtil {
     private static Map<String, String> readHeaders(InputStream in) throws IOException {
         HashMap<String, String> map = new HashMap<>();
         String line;
+        int count = 0;
         while ((line = readLine(in)) != null) {
             if (line.isEmpty())
                 break;
+            if (++count > MAX_HEADER_COUNT)
+                throw new IOException("Too many headers in WebSocket handshake response");
             int colonPos = line.indexOf(":");
             if (colonPos >= 0) {
                 String key = line.substring(0, colonPos).trim();
@@ -151,6 +157,9 @@ class SimpleWebsocketUtil {
                     read -= 1;
                 }
                 break;
+            }
+            if (read >= MAX_LINE_LENGTH) {
+                throw new IOException("Line too long in WebSocket handshake response");
             }
             if (read >= bytes.length) {
                 bytes = Arrays.copyOf(bytes, bytes.length * 2);
