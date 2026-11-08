@@ -31,7 +31,6 @@ class SimpleWebsocketUtil {
         int defaultPort = secure ? 443 : 80;
         if (port == -1)
             port = defaultPort;
-        String path = uri.getPath();
 
         Socket socket = new Socket();
 
@@ -57,10 +56,10 @@ class SimpleWebsocketUtil {
             String nonce = Util.generateNonce();
             String expectedResponse = Util.generateExpectedResponse(nonce);
 
-            String requestPath = uri.toString();
-            int position = requestPath.indexOf("/", requestPath.indexOf("//") + 2);
-            requestPath = position == -1 ? "/" : requestPath.substring(position);
-            if (requestPath.contains("#")) requestPath = requestPath.substring(0, requestPath.indexOf("#"));
+            // Keep the path and query exactly as given (still percent-encoded), drop the fragment.
+            String requestPath = uri.getRawPath();
+            if (requestPath == null || requestPath.isEmpty()) requestPath = "/";
+            if (uri.getRawQuery() != null) requestPath += "?" + uri.getRawQuery();
 
             writeLine(out, "GET " + requestPath + " HTTP/1.1");
             writeLine(out, "Host: " + host + (port == defaultPort ? "" : (":" + port)));
