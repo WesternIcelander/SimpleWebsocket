@@ -142,7 +142,7 @@ public class SimpleWebsocket implements Closeable {
         boolean rsv3 = (opcode & 0x10) != 0;
         opcode = opcode & 0x0F;
         long lengthOfPayload = (long) in.read();
-        if (opcode == -1L) {
+        if (lengthOfPayload == -1L) {
             return null;
         }
         boolean mask = (lengthOfPayload & 0x80L) != 0L;
