@@ -18,7 +18,7 @@
         <dependency>
             <groupId>io.siggi</groupId>
             <artifactId>SiggiHTTP</artifactId>
-            <version>1.6</version>
+            <version>1.10</version>
             <scope>provided</scope>
         </dependency>
     </dependencies>
