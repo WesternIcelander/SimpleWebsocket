@@ -116,6 +116,35 @@ public class SimpleWebsocket implements Closeable {
         this.maxMessageSize = maxMessageSize;
     }
 
+    /**
+     * Get the read timeout. See {@link #setReadTimeout(int)}.
+     *
+     * @return the read timeout in milliseconds, 0 if reads never time out
+     * @throws IOException if the timeout could not be read from the socket
+     */
+    public int getReadTimeout() throws IOException {
+        return socket.getSoTimeout();
+    }
+
+    /**
+     * Set how long a read may wait for data from the peer before failing with a
+     * {@link java.net.SocketTimeoutException}. Defaults to 15 seconds.
+     * <p>
+     * In non-blocking mode, the pings sent every {@code pingFrequency} milliseconds make a responsive peer send pongs,
+     * so the timeout only triggers when the peer has stopped responding. In blocking mode no pings are sent
+     * automatically, and browsers don't send pings of their own, so either send pings yourself (for example from
+     * another thread, at an interval shorter than the timeout), or set the timeout to 0 to disable it.
+     * <p>
+     * A timeout may happen in the middle of a frame, so treat it as fatal and close the connection.
+     *
+     * @param timeoutMillis the read timeout in milliseconds, 0 to never time out
+     * @throws IOException if the timeout could not be set on the socket
+     */
+    public void setReadTimeout(int timeoutMillis) throws IOException {
+        if (timeoutMillis < 0) throw new IllegalArgumentException("timeoutMillis must not be negative");
+        socket.setSoTimeout(timeoutMillis);
+    }
+
     public void useNonBlockingMode(long pingFrequency) {
         useNonBlockingMode(pingFrequency, true, null);
     }
@@ -142,6 +171,17 @@ public class SimpleWebsocket implements Closeable {
         }
     }
 
+    /**
+     * Read the next message, blocking until one arrives. Control frames (ping, pong and close) are returned too, and
+     * pings are not answered automatically in blocking mode. Reply to a ping with
+     * {@link WebSocketMessage#createPong(WebSocketMessage)}.
+     * <p>
+     * Reads time out after the read timeout (15 seconds by default) if nothing arrives. See
+     * {@link #setReadTimeout(int)}.
+     *
+     * @return the message, or null if the connection was closed
+     * @throws IOException if an I/O error occurs, or the read times out
+     */
     public WebSocketMessage read() throws IOException {
         if (nonBlockingMode) {
             throw new IllegalStateException("Non blocking mode in use! Add an event listener instead!");
