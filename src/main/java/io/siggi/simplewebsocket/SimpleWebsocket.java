@@ -469,8 +469,17 @@ public class SimpleWebsocket implements Closeable {
                         if (closed) {
                             break a;
                         }
+                        if (pingFrequency <= 0L) {
+                            // Pings disabled, wait until there's something to send.
+                            try {
+                                sendQueueLock.wait();
+                            } catch (InterruptedException e) {
+                                break a;
+                            }
+                            continue;
+                        }
                         long now = System.currentTimeMillis();
-                        boolean needToSendPing = pingFrequency > 0L && (now - lastSentPing) >= pingFrequency;
+                        boolean needToSendPing = (now - lastSentPing) >= pingFrequency;
                         long nextPing;
                         if (needToSendPing) {
                             lastSentPing = now;
