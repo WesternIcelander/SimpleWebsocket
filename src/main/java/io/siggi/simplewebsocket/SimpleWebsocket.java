@@ -73,7 +73,7 @@ public class SimpleWebsocket implements Closeable {
      * How long close() waits to write the close frame before forcibly closing the socket.
      */
     private static final long CLOSE_TIMEOUT = 5000L;
-    private static ScheduledThreadPoolExecutor closeTimer;
+    private volatile int writeTimeout = 15000;
 
     private final long id;
     private static long nextId = 0;
@@ -177,6 +177,27 @@ public class SimpleWebsocket implements Closeable {
     public void setReadTimeout(int timeoutMillis) throws IOException {
         if (timeoutMillis < 0) throw new IllegalArgumentException("timeoutMillis must not be negative");
         socket.setSoTimeout(timeoutMillis);
+    }
+
+    /**
+     * Get the write timeout. See {@link #setWriteTimeout(int)}.
+     *
+     * @return the write timeout in milliseconds, 0 if writes never time out
+     */
+    public int getWriteTimeout() {
+        return writeTimeout;
+    }
+
+    /**
+     * Set how long writing a single frame may take. If the peer stops reading, its receive buffer fills up and writes
+     * block. When a write takes longer than this, the connection is closed and the write fails with an IOException,
+     * so a peer that doesn't read can't block a sending thread forever. Defaults to 15 seconds.
+     *
+     * @param timeoutMillis the write timeout in milliseconds, 0 to never time out
+     */
+    public void setWriteTimeout(int timeoutMillis) {
+        if (timeoutMillis < 0) throw new IllegalArgumentException("timeoutMillis must not be negative");
+        this.writeTimeout = timeoutMillis;
     }
 
     public void useNonBlockingMode(long pingFrequency) {
@@ -374,7 +395,29 @@ public class SimpleWebsocket implements Closeable {
     private void writeFrame(WebSocketMessage msg) throws IOException {
         if (sentCloseFrame) return;
         if (msg.getOpcode() == WebSocketMessage.OPCODE_CLOSE) sentCloseFrame = true;
-        send1(msg);
+        int timeout = writeTimeout;
+        ScheduledFuture<?> timer = timeout > 0
+                ? closeTimer().schedule(this::writeTimedOut, timeout, TimeUnit.MILLISECONDS)
+                : null;
+        try {
+            send1(msg);
+        } finally {
+            if (timer != null) timer.cancel(false);
+        }
+    }
+
+    /**
+     * A write took longer than the write timeout, the peer has stopped reading. Closing the socket makes the stuck
+     * write fail with an IOException.
+     */
+    private void writeTimedOut() {
+        synchronized (sendQueueLock) {
+            closed = true;
+            closeQueued = true;
+            sendQueue.clear();
+            sendQueueLock.notifyAll();
+        }
+        closeSocket();
     }
 
     private void send1(WebSocketMessage msg) throws IOException {
@@ -504,16 +547,21 @@ public class SimpleWebsocket implements Closeable {
         }
     }
 
-    private static synchronized ScheduledExecutorService closeTimer() {
-        if (closeTimer == null) {
-            closeTimer = new ScheduledThreadPoolExecutor(1, r -> {
-                Thread t = new Thread(r, "SimpleWebsocket-CloseTimer");
-                t.setDaemon(true);
-                return t;
-            });
-            closeTimer.setRemoveOnCancelPolicy(true);
+    private static ScheduledExecutorService closeTimer() {
+        return CloseTimer.INSTANCE;
+    }
+
+    private static class CloseTimer {
+        // Created on first use (class initialization is lazy), shared by all websockets.
+        private static final ScheduledThreadPoolExecutor INSTANCE = new ScheduledThreadPoolExecutor(1, r -> {
+            Thread t = new Thread(r, "SimpleWebsocket-CloseTimer");
+            t.setDaemon(true);
+            return t;
+        });
+
+        static {
+            INSTANCE.setRemoveOnCancelPolicy(true);
         }
-        return closeTimer;
     }
 
     // Copy-on-write, so listeners can add or remove listeners from inside a callback.
