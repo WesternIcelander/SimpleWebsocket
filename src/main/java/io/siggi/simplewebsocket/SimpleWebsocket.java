@@ -92,6 +92,11 @@ public class SimpleWebsocket implements Closeable {
      * How long close() waits to write the close frame before forcibly closing the socket.
      */
     private static final long CLOSE_TIMEOUT = 5000L;
+    /**
+     * How long to discard input after failing the connection, before closing the socket.
+     */
+    private static final long DISCARD_INPUT_TIMEOUT = 1000L;
+    private volatile ScheduledFuture<?> forceCloseTimer;
     private volatile int writeTimeout = 15000;
 
     private final long id;
@@ -281,7 +286,14 @@ public class SimpleWebsocket implements Closeable {
         if (nonBlockingMode) {
             throw new IllegalStateException("Non blocking mode in use! Add an event listener instead!");
         }
-        return read0();
+        try {
+            return read0();
+        } catch (IOException e) {
+            if (closed) {
+                return null; // The socket was closed while closing the connection.
+            }
+            throw e;
+        }
     }
 
     private final ByteArrayOutputStream readBuffer = new ByteArrayOutputStream();
@@ -296,6 +308,7 @@ public class SimpleWebsocket implements Closeable {
             }
             WebSocketPacket pkt = read1();
             if (pkt == null) {
+                abort(); // The stream ended or the connection was failed, nothing more can be read.
                 return null;
             }
             if (pkt.opcode == WebSocketMessage.OPCODE_CLOSE) {
@@ -312,7 +325,7 @@ public class SimpleWebsocket implements Closeable {
                 }
                 receivedCloseFrame = true;
                 // Answer with a close frame echoing the status code (unless we sent one already), then close.
-                closeWith(p.length >= 2 ? new byte[]{p[0], p[1]} : new byte[0]);
+                closeWith(p.length >= 2 ? new byte[]{p[0], p[1]} : new byte[0], false);
                 return new WebSocketMessage(pkt.opcode, p);
             }
             if (pkt.opcode >= 0x8) {
@@ -532,6 +545,15 @@ public class SimpleWebsocket implements Closeable {
         } finally {
             if (timer != null) timer.cancel(false);
         }
+        if (sentCloseFrame) {
+            // Nothing may be sent after a close frame. Half-close so the peer sees the end of the stream, while we
+            // can still read its close frame.
+            try {
+                socket.shutdownOutput();
+            } catch (IOException | UnsupportedOperationException ignored) {
+                // SSLSocket doesn't support half-closing.
+            }
+        }
     }
 
     /**
@@ -546,13 +568,7 @@ public class SimpleWebsocket implements Closeable {
      * Close the connection immediately without a close frame, discarding anything queued.
      */
     private void abort() {
-        synchronized (sendQueueLock) {
-            closed = true;
-            closeQueued = true;
-            sendQueue.clear();
-            queuedBytes = 0L;
-            sendQueueLock.notifyAll();
-        }
+        markClosed();
         closeSocket();
     }
 
@@ -604,35 +620,38 @@ public class SimpleWebsocket implements Closeable {
     }
 
     /**
-     * Send a close frame with the given status code (best effort, written immediately, bypassing the send queue)
-     * and close the connection.
+     * Fail the connection: send a close frame with the status code and close.
      */
     private void closeWithStatus(int statusCode) {
-        closeWith(new byte[]{(byte) ((statusCode >> 8) & 0xff), (byte) (statusCode & 0xff)});
+        closeWith(new byte[]{(byte) ((statusCode >> 8) & 0xff), (byte) (statusCode & 0xff)}, true);
     }
 
     /**
-     * Send a close frame with the given payload (best effort, written immediately, bypassing the send queue) and
-     * close the connection.
+     * Send a close frame with the given payload (written immediately, bypassing the send queue) and close the
+     * socket. Only called from the thread reading from the socket.
+     *
+     * @param payload      the close frame payload
+     * @param discardInput true when failing the connection: unread input is discarded for a short while before
+     *                     closing, because closing a socket with unread input sends a TCP reset, which can make the
+     *                     peer lose the close frame
      */
-    private void closeWith(byte[] payload) {
-        // Write the close frame before setting closed: in non-blocking mode the outgoing thread exits and closes
-        // the socket as soon as it sees closed with an empty queue, which would race with this write.
-        closeNow(new WebSocketMessage(WebSocketMessage.OPCODE_CLOSE, payload));
-        synchronized (sendQueueLock) {
-            closed = true;
-            closeQueued = true;
-            sendQueue.clear();
-            queuedBytes = 0L;
-            sendQueueLock.notifyAll();
+    private void closeWith(byte[] payload, boolean discardInput) {
+        scheduleForceClose();
+        // Write the close frame before setting closed: in non-blocking mode the outgoing thread exits as soon as it
+        // sees closed with an empty queue.
+        writeCloseFrame(payload);
+        markClosed();
+        if (discardInput) {
+            discardInput();
         }
+        closeSocket();
     }
 
     /**
-     * Close the connection, sending a close frame first.
+     * Close the connection, sending a close frame first. The socket is closed when the peer answers with its own
+     * close frame (read by whichever thread is reading), or after 5 seconds.
      * <p>
-     * In non-blocking mode this returns immediately: messages already queued are sent, followed by the close frame,
-     * and then the socket is closed. If that takes longer than 5 seconds, the socket is closed anyway.
+     * In non-blocking mode this returns immediately: messages already queued are sent first, then the close frame.
      *
      * @throws IOException never in practice, errors while closing are ignored
      */
@@ -651,42 +670,85 @@ public class SimpleWebsocket implements Closeable {
             closeQueued = true;
             sendQueueLock.notifyAll();
         }
+        scheduleForceClose();
         if (letOutgoingThreadFinish) {
-            // The outgoing thread sends what's queued, then closes the socket.
-            scheduleForceClose();
-            return;
+            return; // The outgoing thread sends what's queued, then the close frame.
         }
-        closeNow(WebSocketMessage.create(WebSocketMessage.OPCODE_CLOSE));
-    }
-
-    /**
-     * Write the close frame and close the socket. If another thread is stuck writing to a peer that isn't reading,
-     * the socket is closed after {@link #CLOSE_TIMEOUT} anyway, which also unblocks that thread.
-     */
-    private void closeNow(WebSocketMessage closeFrame) {
-        ScheduledFuture<?> forceClose = scheduleForceClose();
-        try {
-            if (writeLock.tryLock(CLOSE_TIMEOUT, TimeUnit.MILLISECONDS)) {
-                try {
-                    writeFrame(closeFrame);
-                } catch (IOException ignored) {
-                } finally {
-                    writeLock.unlock();
-                }
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        } finally {
-            forceClose.cancel(false);
+        if (!writeCloseFrame(new byte[0])) {
             closeSocket();
         }
     }
 
-    private ScheduledFuture<?> scheduleForceClose() {
-        return closeTimer().schedule(this::closeSocket, CLOSE_TIMEOUT, TimeUnit.MILLISECONDS);
+    /**
+     * Write a close frame, unless one has been written already. Waits at most {@link #CLOSE_TIMEOUT} for another
+     * thread's write to finish.
+     *
+     * @return true if a close frame has been written, by this call or earlier
+     */
+    private boolean writeCloseFrame(byte[] payload) {
+        try {
+            if (!writeLock.tryLock(CLOSE_TIMEOUT, TimeUnit.MILLISECONDS)) {
+                return false;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        try {
+            writeFrame(new WebSocketMessage(WebSocketMessage.OPCODE_CLOSE, payload));
+            return true;
+        } catch (IOException e) {
+            return false;
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    private void markClosed() {
+        synchronized (sendQueueLock) {
+            closed = true;
+            closeQueued = true;
+            sendQueue.clear();
+            queuedBytes = 0L;
+            sendQueueLock.notifyAll();
+        }
+    }
+
+    /**
+     * Read and discard input until the peer closes the connection, for at most {@link #DISCARD_INPUT_TIMEOUT}.
+     */
+    private void discardInput() {
+        long deadline = System.currentTimeMillis() + DISCARD_INPUT_TIMEOUT;
+        byte[] buffer = new byte[8192];
+        try {
+            long remaining;
+            while ((remaining = deadline - System.currentTimeMillis()) > 0L) {
+                socket.setSoTimeout((int) remaining);
+                if (in.read(buffer) == -1) {
+                    return;
+                }
+            }
+        } catch (IOException ignored) {
+        }
+    }
+
+    /**
+     * Make sure the socket gets closed after {@link #CLOSE_TIMEOUT} even if the peer never completes the closing
+     * handshake. This also unblocks any thread stuck writing to a peer that isn't reading.
+     */
+    private void scheduleForceClose() {
+        synchronized (sendQueueLock) {
+            if (forceCloseTimer == null) {
+                forceCloseTimer = closeTimer().schedule(this::closeSocket, CLOSE_TIMEOUT, TimeUnit.MILLISECONDS);
+            }
+        }
     }
 
     private void closeSocket() {
+        ScheduledFuture<?> timer = forceCloseTimer;
+        if (timer != null) {
+            timer.cancel(false);
+        }
         try {
             socket.close();
         } catch (IOException ignored) {
@@ -776,7 +838,8 @@ public class SimpleWebsocket implements Closeable {
                             break;
                         }
                         if (closed) {
-                            // Everything queued before close() has been sent.
+                            // Everything queued before close() has been sent, including the close frame. The
+                            // socket is closed when the peer answers, or by the force-close timer.
                             return;
                         }
                         if (pingFrequency <= 0L) {
@@ -798,15 +861,7 @@ public class SimpleWebsocket implements Closeable {
                 send0(msg);
             }
         } catch (IOException | InterruptedException e) {
-        } finally {
-            synchronized (sendQueueLock) {
-                closed = true;
-                closeQueued = true;
-                sendQueue.clear();
-            queuedBytes = 0L;
-                sendQueueLock.notifyAll();
-            }
-            closeSocket();
+            abort();
         }
     }
 
