@@ -38,6 +38,16 @@ public class SimpleWebsocket implements Closeable {
     private final SecureRandom random;
 
     /**
+     * Close status code for a normal closure.
+     */
+    public static final int CLOSE_NORMAL = 1000;
+
+    /**
+     * Close status code for an endpoint going away, such as a server shutting down.
+     */
+    public static final int CLOSE_GOING_AWAY = 1001;
+
+    /**
      * Close status code sent when an incoming frame or message exceeds the configured limits.
      */
     public static final int CLOSE_MESSAGE_TOO_BIG = 1009;
@@ -707,6 +717,45 @@ public class SimpleWebsocket implements Closeable {
      */
     @Override
     public void close() throws IOException {
+        close0(new byte[0]);
+    }
+
+    /**
+     * Close the connection with a status code. See {@link #close(int, String)}.
+     *
+     * @param statusCode the close status code, such as {@link #CLOSE_NORMAL}
+     * @throws IOException never in practice, errors while closing are ignored
+     */
+    public void close(int statusCode) throws IOException {
+        close(statusCode, null);
+    }
+
+    /**
+     * Close the connection with a status code and a reason, which the peer receives in the close frame. Otherwise
+     * the same as {@link #close()}. Does nothing if the connection is already closed or closing.
+     *
+     * @param statusCode the close status code: 1000-1003, 1007-1014 (see the CLOSE_ constants), or 3000-4999 for
+     *                   application defined codes
+     * @param reason     a short human readable reason, at most 123 bytes as UTF-8, or null
+     * @throws IllegalArgumentException if the status code may not be sent, or the reason is too long
+     * @throws IOException              never in practice, errors while closing are ignored
+     */
+    public void close(int statusCode, String reason) throws IOException {
+        if (!isValidCloseCode(statusCode)) {
+            throw new IllegalArgumentException("Invalid close status code: " + statusCode);
+        }
+        byte[] reasonBytes = reason == null ? new byte[0] : reason.getBytes(StandardCharsets.UTF_8);
+        if (reasonBytes.length > 123) { // control frame payloads are limited to 125 bytes, 2 are the status code
+            throw new IllegalArgumentException("Close reason is longer than 123 bytes as UTF-8");
+        }
+        byte[] payload = new byte[2 + reasonBytes.length];
+        payload[0] = (byte) (statusCode >> 8);
+        payload[1] = (byte) statusCode;
+        System.arraycopy(reasonBytes, 0, payload, 2, reasonBytes.length);
+        close0(payload);
+    }
+
+    private void close0(byte[] payload) {
         boolean letOutgoingThreadFinish;
         synchronized (sendQueueLock) {
             if (closed) {
@@ -715,7 +764,7 @@ public class SimpleWebsocket implements Closeable {
             closed = true;
             letOutgoingThreadFinish = nonBlockingMode;
             if (letOutgoingThreadFinish && !closeQueued) {
-                sendQueue.add(WebSocketMessage.create(WebSocketMessage.OPCODE_CLOSE));
+                sendQueue.add(new WebSocketMessage(WebSocketMessage.OPCODE_CLOSE, payload));
             }
             closeQueued = true;
             sendQueueLock.notifyAll();
@@ -724,7 +773,7 @@ public class SimpleWebsocket implements Closeable {
         if (letOutgoingThreadFinish) {
             return; // The outgoing thread sends what's queued, then the close frame.
         }
-        if (!writeCloseFrame(new byte[0])) {
+        if (!writeCloseFrame(payload)) {
             closeSocket();
         }
     }

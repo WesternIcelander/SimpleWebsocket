@@ -109,4 +109,28 @@ public class WebSocketMessage {
     public String getText() {
         return new String(bytes, StandardCharsets.UTF_8);
     }
+
+    /**
+     * Get the status code of a close message.
+     *
+     * @return the status code, or 1005 (No Status Received) if the close message has none
+     * @throws IllegalStateException if this is not a close message
+     */
+    public int getCloseStatusCode() {
+        if (opcode != OPCODE_CLOSE) throw new IllegalStateException("Not a close message");
+        if (bytes.length < 2) return 1005;
+        return ((bytes[0] & 0xff) << 8) | (bytes[1] & 0xff);
+    }
+
+    /**
+     * Get the reason of a close message.
+     *
+     * @return the reason, or an empty string if the close message has none
+     * @throws IllegalStateException if this is not a close message
+     */
+    public String getCloseReason() {
+        if (opcode != OPCODE_CLOSE) throw new IllegalStateException("Not a close message");
+        if (bytes.length <= 2) return "";
+        return new String(bytes, 2, bytes.length - 2, StandardCharsets.UTF_8);
+    }
 }
