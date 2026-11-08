@@ -18,7 +18,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class SimpleWebsocket implements Closeable {
     private final Socket socket;
@@ -35,14 +40,35 @@ public class SimpleWebsocket implements Closeable {
 
     private volatile long maxPayloadLength = 16384;
     private volatile long maxMessageSize = 1048576;
-    private final Object writeLock = new Object();
     private long pingFrequency = 5000L;
-    private boolean sentCloseFrame = false;
-    private boolean nonBlockingMode = false;
+    private volatile boolean nonBlockingMode = false;
     private boolean handleIncomingPingsAutomatically = true;
+
+    /**
+     * Held while writing a frame. Never acquire sendQueueLock while holding this.
+     */
+    private final ReentrantLock writeLock = new ReentrantLock();
+    /**
+     * A close frame has been written, nothing more may be written. Guarded by writeLock.
+     */
+    private boolean sentCloseFrame = false;
+
+    /**
+     * Guards the send queue and the close flags. Never held while doing I/O.
+     */
     private final Object sendQueueLock = new Object();
-    private boolean closed = false;
+    private volatile boolean closed = false;
+    /**
+     * A close frame has been queued, no more messages are accepted. Guarded by sendQueueLock.
+     */
+    private boolean closeQueued = false;
     private final List<WebSocketMessage> sendQueue = new LinkedList<>();
+
+    /**
+     * How long close() waits to write the close frame before forcibly closing the socket.
+     */
+    private static final long CLOSE_TIMEOUT = 5000L;
+    private static ScheduledThreadPoolExecutor closeTimer;
 
     private final long id;
     private static long nextId = 0;
@@ -293,32 +319,49 @@ public class SimpleWebsocket implements Closeable {
     }
 
     public void send(WebSocketMessage msg) throws IOException {
-        synchronized (sendQueueLock) {
-            if (msg.getOpcode() == WebSocketMessage.OPCODE_CLOSE) {
-                if (sentCloseFrame) {
-                    return;
-                }
-                sentCloseFrame = true;
-            } else {
-                if (sentCloseFrame) {
+        boolean isClose = msg.getOpcode() == WebSocketMessage.OPCODE_CLOSE;
+        if (nonBlockingMode) {
+            synchronized (sendQueueLock) {
+                if (closeQueued) {
+                    if (isClose) return;
                     throw new IllegalStateException("Already sent close frame!");
                 }
-            }
-            if (nonBlockingMode) {
+                if (isClose) closeQueued = true;
                 sendQueue.add(msg);
                 sendQueueLock.notifyAll();
-            } else {
-                send0(msg);
             }
+            return;
+        }
+        writeLock.lock();
+        try {
+            if (sentCloseFrame) {
+                if (isClose) return;
+                throw new IllegalStateException("Already sent close frame!");
+            }
+            writeFrame(msg);
+        } finally {
+            writeLock.unlock();
         }
     }
 
     private final byte[] headerBuffer = new byte[14];
 
     private void send0(WebSocketMessage msg) throws IOException {
-        synchronized (writeLock) {
-            send1(msg);
+        writeLock.lock();
+        try {
+            writeFrame(msg);
+        } finally {
+            writeLock.unlock();
         }
+    }
+
+    /**
+     * Write a frame, unless a close frame has already been written. Must hold writeLock.
+     */
+    private void writeFrame(WebSocketMessage msg) throws IOException {
+        if (sentCloseFrame) return;
+        if (msg.getOpcode() == WebSocketMessage.OPCODE_CLOSE) sentCloseFrame = true;
+        send1(msg);
     }
 
     private void send1(WebSocketMessage msg) throws IOException {
@@ -373,22 +416,14 @@ public class SimpleWebsocket implements Closeable {
      * and close the connection.
      */
     private void closeWithStatus(int statusCode) {
-        try {
-            boolean sendFrame;
-            synchronized (sendQueueLock) {
-                sendFrame = !sentCloseFrame;
-                sentCloseFrame = true;
-            }
-            if (sendFrame) {
-                byte[] payload = new byte[]{(byte) ((statusCode >> 8) & 0xff), (byte) (statusCode & 0xff)};
-                send0(new WebSocketMessage(WebSocketMessage.OPCODE_CLOSE, payload));
-            }
-        } catch (IOException ignored) {
+        synchronized (sendQueueLock) {
+            closed = true;
+            closeQueued = true;
+            sendQueue.clear();
+            sendQueueLock.notifyAll();
         }
-        try {
-            close();
-        } catch (IOException ignored) {
-        }
+        byte[] payload = new byte[]{(byte) ((statusCode >> 8) & 0xff), (byte) (statusCode & 0xff)};
+        closeNow(new WebSocketMessage(WebSocketMessage.OPCODE_CLOSE, payload));
     }
 
     @Override
@@ -398,10 +433,56 @@ public class SimpleWebsocket implements Closeable {
                 return;
             }
             closed = true;
+            closeQueued = true;
             sendQueueLock.notifyAll();
         }
-        send(WebSocketMessage.create(WebSocketMessage.OPCODE_CLOSE));
-        socket.close();
+        closeNow(WebSocketMessage.create(WebSocketMessage.OPCODE_CLOSE));
+    }
+
+    /**
+     * Write the close frame and close the socket. If another thread is stuck writing to a peer that isn't reading,
+     * the socket is closed after {@link #CLOSE_TIMEOUT} anyway, which also unblocks that thread.
+     */
+    private void closeNow(WebSocketMessage closeFrame) {
+        ScheduledFuture<?> forceClose = scheduleForceClose();
+        try {
+            if (writeLock.tryLock(CLOSE_TIMEOUT, TimeUnit.MILLISECONDS)) {
+                try {
+                    writeFrame(closeFrame);
+                } catch (IOException ignored) {
+                } finally {
+                    writeLock.unlock();
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            forceClose.cancel(false);
+            closeSocket();
+        }
+    }
+
+    private ScheduledFuture<?> scheduleForceClose() {
+        return closeTimer().schedule(this::closeSocket, CLOSE_TIMEOUT, TimeUnit.MILLISECONDS);
+    }
+
+    private void closeSocket() {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+        }
+    }
+
+    private static synchronized ScheduledExecutorService closeTimer() {
+        if (closeTimer == null) {
+            closeTimer = new ScheduledThreadPoolExecutor(1, r -> {
+                Thread t = new Thread(r, "SimpleWebsocket-CloseTimer");
+                t.setDaemon(true);
+                return t;
+            });
+            closeTimer.setRemoveOnCancelPolicy(true);
+        }
+        return closeTimer;
     }
 
     // Copy-on-write, so listeners can add or remove listeners from inside a callback.
@@ -458,59 +539,43 @@ public class SimpleWebsocket implements Closeable {
     private void outgoingThread() {
         long lastSentPing = System.currentTimeMillis();
         try {
-            a:
             while (true) {
-                WebSocketMessage msg;
+                WebSocketMessage msg = null;
+                // Pick the next thing to send while holding the queue lock, but write it after releasing the lock,
+                // so a peer that stops reading can't block close() or send().
                 synchronized (sendQueueLock) {
-                    if (closed) {
-                        break;
-                    }
-                    while (sendQueue.isEmpty()) {
+                    while (true) {
                         if (closed) {
-                            break a;
+                            return;
+                        }
+                        if (!sendQueue.isEmpty()) {
+                            msg = sendQueue.remove(0);
+                            break;
                         }
                         if (pingFrequency <= 0L) {
                             // Pings disabled, wait until there's something to send.
-                            try {
-                                sendQueueLock.wait();
-                            } catch (InterruptedException e) {
-                                break a;
-                            }
+                            sendQueueLock.wait();
                             continue;
                         }
-                        long now = System.currentTimeMillis();
-                        boolean needToSendPing = (now - lastSentPing) >= pingFrequency;
-                        long nextPing;
-                        if (needToSendPing) {
-                            lastSentPing = now;
-                            send0(WebSocketMessage.create(WebSocketMessage.OPCODE_PING));
-                            nextPing = pingFrequency;
-                        } else {
-                            nextPing = pingFrequency - (now - lastSentPing);
+                        long untilPing = lastSentPing + pingFrequency - System.currentTimeMillis();
+                        if (untilPing <= 0L) {
+                            break;
                         }
-                        try {
-                            sendQueueLock.wait(nextPing);
-                        } catch (InterruptedException e) {
-                            break a;
-                        }
-                        now = System.currentTimeMillis();
-                        needToSendPing = (now - lastSentPing) >= pingFrequency;
-                        if (needToSendPing) {
-                            lastSentPing = now;
-                            send0(WebSocketMessage.create(WebSocketMessage.OPCODE_PING));
-                        }
+                        sendQueueLock.wait(untilPing);
                     }
-                    msg = sendQueue.remove(0);
                 }
-                if (msg != null) {
-                    send0(msg);
+                if (msg == null) {
+                    lastSentPing = System.currentTimeMillis();
+                    msg = WebSocketMessage.create(WebSocketMessage.OPCODE_PING);
                 }
+                send0(msg);
             }
-        } catch (IOException e) {
-        }
-        try {
-            close();
-        } catch (Exception e) {
+        } catch (IOException | InterruptedException e) {
+        } finally {
+            try {
+                close();
+            } catch (Exception e) {
+            }
         }
     }
 
