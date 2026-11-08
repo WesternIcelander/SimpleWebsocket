@@ -614,6 +614,16 @@ public class SimpleWebsocket implements Closeable {
         out.flush();
     }
 
+    /**
+     * XOR the message with the mask key, in place.
+     *
+     * @param maskKey the 4-byte mask key, or null to leave the message unchanged
+     * @param message the message, which is modified
+     * @return the same array as message
+     * @deprecated Internal helper that was public by mistake, no longer used by this library. It modifies the array
+     * passed to it. Will be removed in a future version.
+     */
+    @Deprecated
     public byte[] maskMessage(byte[] maskKey, byte[] message) {
         if (maskKey != null) {
             for (int i = 0; i < message.length; i++) {
