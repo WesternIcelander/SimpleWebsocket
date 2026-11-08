@@ -106,6 +106,19 @@ class SimpleWebsocketUtil {
     static SimpleWebsocket accept(HTTPRequest request) throws IOException {
         if (!isWebsocketRequest(request))
             throw new IOException("Not a Websocket request.");
+        String version = request.getHeader("Sec-WebSocket-Version");
+        if (version == null || !version.trim().equals("13")) {
+            // Tell the client which version we support, so it can retry with that one.
+            try {
+                request.response.setHeader("426 Upgrade Required");
+                request.response.setHeader("Sec-WebSocket-Version", "13");
+                request.response.contentLength(0);
+                request.response.sendHeaders();
+            } catch (IOException | RuntimeException ignored) {
+                // Headers already sent, or the connection is gone. Nothing more to do.
+            }
+            throw new IOException("Unsupported WebSocket version: " + version);
+        }
         String webSocketKey = request.getHeader("Sec-WebSocket-Key");
 
         request.response.setHeader("Sec-WebSocket-Accept", Util.generateExpectedResponse(webSocketKey));

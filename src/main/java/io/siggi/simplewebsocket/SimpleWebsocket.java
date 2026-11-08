@@ -134,6 +134,15 @@ public class SimpleWebsocket implements Closeable {
         return SimpleWebsocketUtil.connect(uri, headers);
     }
 
+    /**
+     * Accept a WebSocket upgrade request. If the client asks for a WebSocket version other than 13, a 426 Upgrade
+     * Required response listing version 13 is sent, and an IOException is thrown.
+     *
+     * @param request the HTTP request
+     * @return the WebSocket
+     * @throws IOException if the request is not a WebSocket request, asks for an unsupported version, or the
+     *                     connection could not be upgraded
+     */
     public static SimpleWebsocket accept(HTTPRequest request) throws IOException {
         return SimpleWebsocketUtil.accept(request);
     }
