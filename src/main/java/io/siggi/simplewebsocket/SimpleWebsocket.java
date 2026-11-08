@@ -68,6 +68,11 @@ public class SimpleWebsocket implements Closeable {
      */
     private boolean closeQueued = false;
     private final List<WebSocketMessage> sendQueue = new LinkedList<>();
+    /**
+     * Total payload bytes in sendQueue. Guarded by sendQueueLock.
+     */
+    private long queuedBytes = 0L;
+    private volatile long maxQueuedBytes = 16L * 1024L * 1024L;
 
     /**
      * How long close() waits to write the close frame before forcibly closing the socket.
@@ -198,6 +203,27 @@ public class SimpleWebsocket implements Closeable {
     public void setWriteTimeout(int timeoutMillis) {
         if (timeoutMillis < 0) throw new IllegalArgumentException("timeoutMillis must not be negative");
         this.writeTimeout = timeoutMillis;
+    }
+
+    /**
+     * Get the send queue limit. See {@link #setMaxQueuedBytes(long)}.
+     *
+     * @return the maximum number of payload bytes waiting to be sent in non-blocking mode
+     */
+    public long getMaxQueuedBytes() {
+        return maxQueuedBytes;
+    }
+
+    /**
+     * Set how many payload bytes may wait in the send queue in non-blocking mode. If a {@link #send(WebSocketMessage)}
+     * would go over this, the peer isn't keeping up: the connection is closed and send throws an IOException.
+     * Defaults to 16 MiB.
+     *
+     * @param maxQueuedBytes the maximum number of queued payload bytes
+     */
+    public void setMaxQueuedBytes(long maxQueuedBytes) {
+        if (maxQueuedBytes < 0L) throw new IllegalArgumentException("maxQueuedBytes must not be negative");
+        this.maxQueuedBytes = maxQueuedBytes;
     }
 
     public void useNonBlockingMode(long pingFrequency) {
@@ -360,11 +386,17 @@ public class SimpleWebsocket implements Closeable {
                     if (isClose) return;
                     throw new IOException("WebSocket is closed");
                 }
-                if (isClose) closeQueued = true;
-                sendQueue.add(msg);
-                sendQueueLock.notifyAll();
+                if (isClose || queuedBytes + msg.getLength() <= maxQueuedBytes) {
+                    if (isClose) closeQueued = true;
+                    sendQueue.add(msg);
+                    queuedBytes += msg.getLength();
+                    sendQueueLock.notifyAll();
+                    return;
+                }
             }
-            return;
+            // The peer isn't keeping up. Drop the connection rather than buffer without limit.
+            abort();
+            throw new IOException("Send queue full, closed the WebSocket");
         }
         writeLock.lock();
         try {
@@ -411,10 +443,18 @@ public class SimpleWebsocket implements Closeable {
      * write fail with an IOException.
      */
     private void writeTimedOut() {
+        abort();
+    }
+
+    /**
+     * Close the connection immediately without a close frame, discarding anything queued.
+     */
+    private void abort() {
         synchronized (sendQueueLock) {
             closed = true;
             closeQueued = true;
             sendQueue.clear();
+            queuedBytes = 0L;
             sendQueueLock.notifyAll();
         }
         closeSocket();
@@ -476,6 +516,7 @@ public class SimpleWebsocket implements Closeable {
             closed = true;
             closeQueued = true;
             sendQueue.clear();
+            queuedBytes = 0L;
             sendQueueLock.notifyAll();
         }
         byte[] payload = new byte[]{(byte) ((statusCode >> 8) & 0xff), (byte) (statusCode & 0xff)};
@@ -626,6 +667,7 @@ public class SimpleWebsocket implements Closeable {
                     while (true) {
                         if (!sendQueue.isEmpty()) {
                             msg = sendQueue.remove(0);
+                            queuedBytes -= msg.getLength();
                             break;
                         }
                         if (closed) {
@@ -656,6 +698,7 @@ public class SimpleWebsocket implements Closeable {
                 closed = true;
                 closeQueued = true;
                 sendQueue.clear();
+            queuedBytes = 0L;
                 sendQueueLock.notifyAll();
             }
             closeSocket();
