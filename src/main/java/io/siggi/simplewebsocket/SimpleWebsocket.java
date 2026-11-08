@@ -519,8 +519,6 @@ public class SimpleWebsocket implements Closeable {
         }
     }
 
-    private final byte[] headerBuffer = new byte[14];
-
     private void send0(WebSocketMessage msg) throws IOException {
         writeLock.lock();
         try {
@@ -573,40 +571,37 @@ public class SimpleWebsocket implements Closeable {
     }
 
     private void send1(WebSocketMessage msg) throws IOException {
-        int headerLength = 2;
-        headerBuffer[0] = (byte) (0x80 + (msg.getOpcode() & 0xF));
+        // Build the whole frame and write it at once: two writes per frame interact badly with Nagle's algorithm
+        // and delayed ACKs.
         int len = msg.getLength();
-        if (len >= 126 && len <= 65535) {
-            headerLength = 4;
-            headerBuffer[1] = (byte) (126);
-            headerBuffer[2] = (byte) ((len >> 8) & 0xff);
-            headerBuffer[3] = (byte) (len & 0xff);
-        } else if (len >= 65536) {
-            headerLength = 10;
-            headerBuffer[1] = (byte) 127;
-            headerBuffer[2] = (byte) 0;
-            headerBuffer[3] = (byte) 0;
-            headerBuffer[4] = (byte) 0;
-            headerBuffer[5] = (byte) 0;
-            headerBuffer[6] = (byte) ((len >> 24) & 0xff);
-            headerBuffer[7] = (byte) ((len >> 16) & 0xff);
-            headerBuffer[8] = (byte) ((len >> 8) & 0xff);
-            headerBuffer[9] = (byte) (len & 0xff);
+        int headerLength = len < 126 ? 2 : (len <= 65535 ? 4 : 10);
+        int payloadOffset = isClient ? headerLength + 4 : headerLength;
+        byte[] frame = new byte[payloadOffset + len];
+        frame[0] = (byte) (0x80 | (msg.getOpcode() & 0xF));
+        if (len < 126) {
+            frame[1] = (byte) len;
+        } else if (len <= 65535) {
+            frame[1] = (byte) 126;
+            frame[2] = (byte) (len >> 8);
+            frame[3] = (byte) len;
         } else {
-            headerBuffer[1] = (byte) (len);
+            frame[1] = (byte) 127;
+            for (int i = 0; i < 8; i++) {
+                frame[2 + i] = (byte) ((long) len >>> (56 - 8 * i));
+            }
         }
-        byte[] mask;
+        msg.copyTo(frame, payloadOffset);
         if (isClient) {
-            mask = new byte[4];
-            random.nextBytes(mask);
-            headerBuffer[1] |= (byte) 0x80;
-            System.arraycopy(mask, 0, headerBuffer, headerLength, 4);
-            headerLength += 4;
-        } else {
-            mask = null;
+            // Clients must mask every frame with a fresh random key.
+            frame[1] |= (byte) 0x80;
+            byte[] maskKey = new byte[4];
+            random.nextBytes(maskKey);
+            System.arraycopy(maskKey, 0, frame, headerLength, 4);
+            for (int i = 0; i < len; i++) {
+                frame[payloadOffset + i] ^= maskKey[i & 3];
+            }
         }
-        out.write(headerBuffer, 0, headerLength);
-        out.write(maskMessage(mask, msg.getBytes()));
+        out.write(frame);
         out.flush();
     }
 

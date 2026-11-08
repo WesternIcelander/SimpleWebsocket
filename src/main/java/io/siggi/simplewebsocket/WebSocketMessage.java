@@ -102,6 +102,10 @@ public class WebSocketMessage {
         System.arraycopy(bytes, 0, b, 0, Math.min(bytes.length, b.length));
     }
 
+    void copyTo(byte[] destination, int offset) {
+        System.arraycopy(bytes, 0, destination, offset, bytes.length);
+    }
+
     public String getText() {
         return new String(bytes, StandardCharsets.UTF_8);
     }

@@ -38,6 +38,7 @@ class SimpleWebsocketUtil {
         boolean success = false;
         try {
             socket.connect(new InetSocketAddress(host, port), HANDSHAKE_TIMEOUT);
+            socket.setTcpNoDelay(true); // WebSocket messages should go out right away, not wait for more data
             socket.setSoTimeout(HANDSHAKE_TIMEOUT);
             if (secure) {
                 // SSLSocket only checks the certificate chain, not that the certificate is for this host.
