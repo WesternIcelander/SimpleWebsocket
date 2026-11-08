@@ -61,7 +61,7 @@ public class SimpleWebsocket implements Closeable {
     private volatile long maxMessageSize = 1048576;
     private long pingFrequency = 5000L;
     private volatile boolean nonBlockingMode = false;
-    private boolean handleIncomingPingsAutomatically = true;
+    private volatile boolean handleIncomingPingsAutomatically = true;
 
     /**
      * Held while writing a frame. Never acquire sendQueueLock while holding this.
@@ -245,8 +245,35 @@ public class SimpleWebsocket implements Closeable {
         this.maxQueuedBytes = maxQueuedBytes;
     }
 
+    /**
+     * Get whether incoming pings are answered automatically. See {@link #setHandleIncomingPingsAutomatically(boolean)}.
+     *
+     * @return true if pings are answered automatically
+     */
+    public boolean isHandlingIncomingPingsAutomatically() {
+        return handleIncomingPingsAutomatically;
+    }
+
+    /**
+     * Set whether incoming pings are answered with a pong automatically. When enabled (the default), pings are not
+     * returned by {@link #read()} or passed to listeners. When disabled, they are, and the application should reply
+     * with {@link WebSocketMessage#createPong(WebSocketMessage)}.
+     *
+     * @param handleIncomingPingsAutomatically true to answer pings automatically
+     */
+    public void setHandleIncomingPingsAutomatically(boolean handleIncomingPingsAutomatically) {
+        this.handleIncomingPingsAutomatically = handleIncomingPingsAutomatically;
+    }
+
+    /**
+     * Switch to non-blocking mode: incoming messages are passed to listeners, sends are queued, and a ping is sent
+     * every pingFrequency milliseconds. Whether pings are answered automatically is kept as set by
+     * {@link #setHandleIncomingPingsAutomatically(boolean)}.
+     *
+     * @param pingFrequency milliseconds between pings, 0 to not send pings
+     */
     public void useNonBlockingMode(long pingFrequency) {
-        useNonBlockingMode(pingFrequency, true, null);
+        useNonBlockingMode(pingFrequency, handleIncomingPingsAutomatically, null);
     }
 
     public void useNonBlockingMode(long pingFrequency, boolean handleIncomingPingsAutomatically, ThreadFactory threadFactory) {
@@ -272,9 +299,9 @@ public class SimpleWebsocket implements Closeable {
     }
 
     /**
-     * Read the next message, blocking until one arrives. Control frames (ping, pong and close) are returned too, and
-     * pings are not answered automatically in blocking mode. Reply to a ping with
-     * {@link WebSocketMessage#createPong(WebSocketMessage)}.
+     * Read the next message, blocking until one arrives. Pong and close frames are returned too. Pings are answered
+     * automatically and not returned, unless that has been turned off with
+     * {@link #setHandleIncomingPingsAutomatically(boolean)}.
      * <p>
      * Reads time out after the read timeout (15 seconds by default) if nothing arrives. See
      * {@link #setReadTimeout(int)}.
@@ -287,7 +314,16 @@ public class SimpleWebsocket implements Closeable {
             throw new IllegalStateException("Non blocking mode in use! Add an event listener instead!");
         }
         try {
-            return read0();
+            while (true) {
+                WebSocketMessage msg = read0();
+                if (msg != null && msg.getOpcode() == WebSocketMessage.OPCODE_PING
+                        && handleIncomingPingsAutomatically) {
+                    // Pongs are written directly rather than through send(), so they don't fail after close().
+                    send0(WebSocketMessage.createPong(msg));
+                    continue;
+                }
+                return msg;
+            }
         } catch (IOException e) {
             if (closed) {
                 return null; // The socket was closed while closing the connection.
